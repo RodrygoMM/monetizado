@@ -4,6 +4,7 @@ import string
 import random
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from urllib.parse import parse_qs  # <- para ler x-www-form-urlencoded
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -98,11 +99,10 @@ class LicencaValidarResponse(BaseModel):
     motivo: Optional[str] = None
     expira_em: Optional[str] = None  # ISO 8601
     api_key_meudanfe: Optional[str] = None
-
-
-# --------------------------------------------------------------------
-# FUNÇÕES AUXILIARES
-# --------------------------------------------------------------------
+    
+    # --------------------------------------------------------------------
+    # FUNÇÕES AUXILIARES
+    # --------------------------------------------------------------------
 
 def gerar_codigo_licenca(tamanho: int = 8) -> str:
     caracteres = string.ascii_uppercase + string.digits
@@ -200,7 +200,7 @@ def buscar_licenca(codigo: str) -> Optional[dict]:
     return doc.to_dict()
 
 # --------------------------------------------------------------------
-# ENDPOINT: WEBHOOK DO PAGBANK (VERSÃO COMPATÍVEL COM FORM + JSON)
+# ENDPOINT: WEBHOOK DO PAGBANK (FORM x-www-form-urlencoded + JSON)
 # --------------------------------------------------------------------
 
 @app.post("/pagbank/webhook")
@@ -208,51 +208,56 @@ async def pagbank_webhook(request: Request):
     """
     Webhook do PagBank.
 
-    Nesta versão:
-    - tenta ler como form x-www-form-urlencoded (notificationCode / notificationType),
-      que é o padrão da Notificação de Transação do PagBank.
-    - se não for form, tenta ler como JSON.
-    - sempre retorna 200 em caso de leitura válida, pra evitar 422.
-    - ainda NÃO gera licença automática; primeiro vamos entender o payload real.
+    - PagBank (Formulário HTML) manda notificationCode/notificationType
+      em application/x-www-form-urlencoded.
+    - Aqui fazemos parse manual do body, sem depender de python-multipart.
+    - Por enquanto só logamos e retornamos 200; depois vamos usar
+      o notificationCode para buscar os dados da transação na API.
     """
 
     print("=== Webhook PagBank recebido ===")
-    print("Headers:", dict(request.headers))
+    headers = dict(request.headers)
+    print("Headers:", headers)
 
-    # 1) Tenta ler como form (padrão de notificação de transação PagBank)
+    content_type = headers.get("content-type", "")
+    raw_body = await request.body()
+    body_text = raw_body.decode(errors="ignore")
+    print("Raw body:", body_text)
+
     data_form = {}
-    try:
-        form = await request.form()
-        data_form = dict(form)
-    except Exception as e:
-        print("Erro ao ler form do PagBank:", e)
+    # Se veio no formato padrão de formulário
+    if "application/x-www-form-urlencoded" in content_type and body_text:
+        parsed = parse_qs(body_text)
+        # parse_qs retorna dict[str, list[str]] -> pegamos só o primeiro valor
+        data_form = {k: (v[0] if isinstance(v, list) and v else v) for k, v in parsed.items()}
 
     if data_form:
-        print("Payload FORM PagBank:", data_form)
+        print("Payload FORM PagBank parseado:", data_form)
 
         notification_code = data_form.get("notificationCode") or data_form.get("notification_code")
         notification_type = data_form.get("notificationType") or data_form.get("notification_type")
 
         print("notificationCode:", notification_code, "notificationType:", notification_type)
 
-        # 👉 Por enquanto, só confirmamos recebimento.
-        # Depois vamos usar o notificationCode para consultar a transação
-        # na API de notificações do PagBank e então gerar a licença.
+        # Aqui ainda não geramos licença. Só confirmamos pro PagBank
+        # que recebemos a notificação.
         return {"ok": True, "tipo": "form", "notificationCode": notification_code}
 
-    # 2) Se não veio form, tenta JSON (para APIs mais novas, se você usar)
+    # Se não for form, tentamos JSON (caso mude o tipo de integração no futuro)
     data_json = None
     try:
-        data_json = await request.json()
-        print("Payload JSON PagBank:", data_json)
+        if body_text.strip().startswith("{"):
+            data_json = json.loads(body_text)
+        else:
+            data_json = await request.json()
     except Exception as e:
         print("Erro ao ler JSON do PagBank:", e)
 
     if data_json:
-        # Aqui você pode adaptar depois para o formato JSON específico.
+        print("Payload JSON PagBank:", data_json)
         return {"ok": True, "tipo": "json", "payload": data_json}
 
-    # 3) Se não conseguiu nem form nem JSON, devolve erro 400
+    # Se não conseguimos entender o payload:
     return JSONResponse(
         status_code=400,
         content={"detail": "Payload do PagBank inválido"},
