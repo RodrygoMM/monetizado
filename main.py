@@ -32,6 +32,8 @@ SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "service-account.json")
 
 # 3) Flag pra decidir se usa arquivo JSON em vez de credencial padrão
+#    No Koyeb: USE_SERVICE_ACCOUNT_FILE=false
+#    Local:    USE_SERVICE_ACCOUNT_FILE=true (e service-account.json no projeto)
 USE_SERVICE_ACCOUNT_FILE = os.getenv("USE_SERVICE_ACCOUNT_FILE", "true").lower() == "true"
 
 db = None
@@ -83,7 +85,6 @@ LICENCES_COLLECTION = "sticky-notes"
 
 app = FastAPI(title="Backend de Licenças da Extensão NF")
 
-
 # --------------------------------------------------------------------
 # MODELOS P/ REQUISIÇÕES E RESPOSTAS
 # --------------------------------------------------------------------
@@ -97,13 +98,6 @@ class LicencaValidarResponse(BaseModel):
     motivo: Optional[str] = None
     expira_em: Optional[str] = None  # ISO 8601
     api_key_meudanfe: Optional[str] = None
-
-
-class PagBankWebhookPayload(BaseModel):
-    status: Optional[str] = None
-    transaction_id: Optional[str] = None
-    id: Optional[str] = None
-    customer: dict = {}
 
 
 # --------------------------------------------------------------------
@@ -205,53 +199,64 @@ def buscar_licenca(codigo: str) -> Optional[dict]:
         return None
     return doc.to_dict()
 
-
 # --------------------------------------------------------------------
-# ENDPOINT: WEBHOOK DO PAGBANK
+# ENDPOINT: WEBHOOK DO PAGBANK (VERSÃO COMPATÍVEL COM FORM + JSON)
 # --------------------------------------------------------------------
 
 @app.post("/pagbank/webhook")
-async def pagbank_webhook(payload: PagBankWebhookPayload):
-    print("Webhook PagBank recebido:", payload.dict())
+async def pagbank_webhook(request: Request):
+    """
+    Webhook do PagBank.
 
-    status_pagamento = payload.status
-    id_transacao = payload.transaction_id or payload.id
+    Nesta versão:
+    - tenta ler como form x-www-form-urlencoded (notificationCode / notificationType),
+      que é o padrão da Notificação de Transação do PagBank.
+    - se não for form, tenta ler como JSON.
+    - sempre retorna 200 em caso de leitura válida, pra evitar 422.
+    - ainda NÃO gera licença automática; primeiro vamos entender o payload real.
+    """
 
-    dados_cliente = payload.customer or {}
-    email_cliente = dados_cliente.get("email")
-    cpf_cliente = dados_cliente.get("tax_id") or dados_cliente.get("cpf")
+    print("=== Webhook PagBank recebido ===")
+    print("Headers:", dict(request.headers))
 
-    if status_pagamento is None or id_transacao is None or email_cliente is None:
-        return JSONResponse(
-            status_code=400,
-            content={"detail": "Payload do PagBank incompleto"},
-        )
+    # 1) Tenta ler como form (padrão de notificação de transação PagBank)
+    data_form = {}
+    try:
+        form = await request.form()
+        data_form = dict(form)
+    except Exception as e:
+        print("Erro ao ler form do PagBank:", e)
 
-    if str(status_pagamento).upper() not in ("PAID", "APPROVED"):
-        return {"ok": True, "ignored": True}
+    if data_form:
+        print("Payload FORM PagBank:", data_form)
 
-    if db is None:
-        raise RuntimeError("Firestore não inicializado corretamente")
+        notification_code = data_form.get("notificationCode") or data_form.get("notification_code")
+        notification_type = data_form.get("notificationType") or data_form.get("notification_type")
 
-    codigo = gerar_codigo_licenca()
-    while db.collection(LICENCES_COLLECTION).document(codigo).get().exists:
-        codigo = gerar_codigo_licenca()
+        print("notificationCode:", notification_code, "notificationType:", notification_type)
 
-    criar_documento_licenca(
-        codigo=codigo,
-        email=email_cliente,
-        cpf=cpf_cliente,
-        id_transacao_pagbank=id_transacao,
-        plano="mensal",
+        # 👉 Por enquanto, só confirmamos recebimento.
+        # Depois vamos usar o notificationCode para consultar a transação
+        # na API de notificações do PagBank e então gerar a licença.
+        return {"ok": True, "tipo": "form", "notificationCode": notification_code}
+
+    # 2) Se não veio form, tenta JSON (para APIs mais novas, se você usar)
+    data_json = None
+    try:
+        data_json = await request.json()
+        print("Payload JSON PagBank:", data_json)
+    except Exception as e:
+        print("Erro ao ler JSON do PagBank:", e)
+
+    if data_json:
+        # Aqui você pode adaptar depois para o formato JSON específico.
+        return {"ok": True, "tipo": "json", "payload": data_json}
+
+    # 3) Se não conseguiu nem form nem JSON, devolve erro 400
+    return JSONResponse(
+        status_code=400,
+        content={"detail": "Payload do PagBank inválido"},
     )
-
-    enviar_email_licenca(
-        para_email=email_cliente,
-        codigo_licenca=codigo,
-    )
-
-    return {"ok": True, "licenca_gerada": codigo}
-
 
 # --------------------------------------------------------------------
 # ENDPOINT: VALIDAÇÃO DE LICENÇA (CHAMADO PELA EXTENSÃO)
@@ -303,7 +308,6 @@ async def validar_licenca(body: LicencaValidarRequest):
         expira_em=expira_dt.isoformat() if expira_dt else None,
         api_key_meudanfe=None,
     )
-
 
 # --------------------------------------------------------------------
 # ENDPOINT SIMPLES SÓ PRA TESTAR SE A API ESTÁ NO AR
